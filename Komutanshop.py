@@ -40,7 +40,7 @@ from telegram.ext import (
 BOT_TOKEN = "8850038202:AAGkr_QlbJJxSAvHR20-zLpWFYUSrYcwa0U"  # 👈 TOKEN'IN
 
 # Pasarguard API - DOĞRUDAN API ADRESİ
-API_URL = "https://crc.fastline-tm-belet-film.ru:8000/api"  # 👈 API URL'İN
+API_URL = "https://5.42.122.113:8000/api"  # 👈 API URL'İN
 
 # Admin Giriş Bilgileri
 ADMIN_USERNAME = "komutan31"  # 👈 KULLANICI ADIN
