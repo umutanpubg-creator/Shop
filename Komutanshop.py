@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-PasarGuard Failover Bot - ÇALIŞAN VERSİYON
+PasarGuard Failover Bot - FORM-DATA İLE ÇALIŞIYOR!
 """
 
 import os
 import json
 import time
 import logging
-import threading
-from typing import Optional, Tuple, List
-from datetime import datetime
-
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -46,24 +42,33 @@ STATE_FILE = "pasarguard_state.json"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 # ============================================
-# PASARGUARD API
+# API SINIFI - FORM-DATA İLE GİRİŞ
 # ============================================
 
-class PasarGuardAPI:
+class PasarAPI:
     def __init__(self):
         self.token = None
         self.session = requests.Session()
         self.session.verify = False
         self.base_url = PANEL_URL
-        self.logged_in = False
 
     def login(self) -> bool:
+        """FORM-DATA ile giriş - BU ÇALIŞIYOR!"""
         try:
+            logging.info("🔐 API giriş (form-data)...")
+            
+            # ÖNEMLİ: data= kullan, json= DEĞİL!
             response = self.session.post(
                 f"{self.base_url}/api/admin/token",
-                data={"username": ADMIN_USER, "password": ADMIN_PASS},
+                data={  # ← data= kullan!
+                    "username": ADMIN_USER,
+                    "password": ADMIN_PASS
+                },
                 timeout=10
             )
+            
+            logging.info(f"   Status: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
                 self.token = data.get("access_token")
@@ -72,18 +77,18 @@ class PasarGuardAPI:
                         "Authorization": f"Bearer {self.token}",
                         "Content-Type": "application/json"
                     })
-                    self.logged_in = True
-                    logging.info("✅ API giriş başarılı!")
+                    logging.info(f"✅ Token alındı: {self.token[:20]}...")
                     return True
             else:
-                logging.error(f"❌ API giriş başarısız: {response.status_code}")
-            return False
+                logging.error(f"❌ Hata {response.status_code}: {response.text[:200]}")
+                
         except Exception as e:
-            logging.error(f"❌ API giriş hatası: {e}")
-            return False
+            logging.error(f"❌ Exception: {e}")
+            
+        return False
 
     def ensure_login(self) -> bool:
-        if not self.logged_in or not self.token:
+        if not self.token:
             return self.login()
         return True
 
@@ -105,7 +110,7 @@ class PasarGuardAPI:
         except:
             return False
 
-    def get_nodes(self) -> List[dict]:
+    def get_nodes(self) -> list:
         if not self.ensure_login():
             return []
         try:
@@ -122,7 +127,7 @@ class PasarGuardAPI:
 
 
 # ============================================
-# STATE YÖNETİMİ
+# STATE
 # ============================================
 
 def load_state() -> dict:
@@ -134,7 +139,6 @@ def load_state() -> dict:
             data = json.load(f)
     except:
         data = {}
-    
     data.setdefault("node_index", 0)
     data.setdefault("auto_enabled", True)
     data.setdefault("bad_count", 0)
@@ -150,20 +154,23 @@ def save_state(state: dict):
 
 
 # ============================================
-# TRAFİK ÖLÇÜM
+# TRAFİK
 # ============================================
 
-def read_iface_bytes(iface: str) -> Tuple[int, int]:
-    with open("/proc/net/dev", "r") as f:
-        for line in f:
-            if ":" in line:
-                name, data = line.split(":", 1)
-                if name.strip() == iface:
-                    parts = data.split()
-                    return int(parts[0]), int(parts[8])
-    raise RuntimeError(f"Interface {iface} not found")
+def read_iface_bytes(iface: str):
+    try:
+        with open("/proc/net/dev", "r") as f:
+            for line in f:
+                if ":" in line:
+                    name, data = line.split(":", 1)
+                    if name.strip() == iface:
+                        parts = data.split()
+                        return int(parts[0]), int(parts[8])
+    except:
+        pass
+    return 0, 0
 
-def calc_bps(state: dict) -> Optional[int]:
+def calc_bps(state: dict):
     now = time.time()
     try:
         rx, tx = read_iface_bytes(NET_IFACE)
@@ -187,12 +194,12 @@ def calc_bps(state: dict) -> Optional[int]:
 
 
 # ============================================
-# API = OLUŞTUR
+# CORE
 # ============================================
 
-api = PasarGuardAPI()
+api = PasarAPI()
 
-def get_current_host_ips() -> Tuple[Optional[str], Optional[str]]:
+def get_current_host_ips():
     hosts = api.get_hosts()
     if not hosts:
         return None, None
@@ -205,16 +212,13 @@ def set_host_ips(ip1: str, ip2: str) -> bool:
     hosts = api.get_hosts()
     if not hosts or SS_TAG not in hosts:
         return False
-    
     ss_hosts = hosts[SS_TAG]
     if not isinstance(ss_hosts, list) or len(ss_hosts) < 2:
         return False
-    
     ss_hosts[0]["address"] = ip1
     ss_hosts[1]["address"] = ip2
     ss_hosts[0]["is_disabled"] = False
     ss_hosts[1]["is_disabled"] = False
-    
     hosts[SS_TAG] = ss_hosts
     return api.put_hosts(hosts)
 
@@ -223,40 +227,32 @@ def switch_to_next_node(state: dict) -> bool:
     if not nodes:
         logging.error("❌ Node listesi alınamadı!")
         return False
-    
     nodes_dict = {n.get("id"): n.get("ip") for n in nodes if isinstance(n, dict)}
-    
     current_idx = state.get("node_index", 0) % len(NODE_LIST)
     next_idx = (current_idx + 1) % len(NODE_LIST)
-    
     node1 = NODE_LIST[current_idx]
     node2 = NODE_LIST[next_idx]
-    
     ip1 = nodes_dict.get(node1["id"], node1["ip"])
     ip2 = nodes_dict.get(node2["id"], node2["ip"])
-    
     logging.info(f"🔄 Geçiş: {node1['name']} ({ip1}) / {node2['name']} ({ip2})")
-    
     if set_host_ips(ip1, ip2):
         state["node_index"] = (next_idx + 1) % len(NODE_LIST)
         state["bad_count"] = 0
         state["switch_count"] = state.get("switch_count", 0) + 1
-        logging.info(f"✅ Geçiş başarılı!")
         return True
-    
     return False
 
 
 # ============================================
-# TELEGRAM BOT
+# TELEGRAM
 # ============================================
 
-def menu_kb(state: dict) -> InlineKeyboardMarkup:
-    auto = "🟢 Otomatik: AÇIK" if state.get("auto_enabled", True) else "🔴 Otomatik: KAPALI"
+def menu_kb(state: dict):
+    auto = "🟢 AÇIK" if state.get("auto_enabled", True) else "🔴 KAPALI"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Durum", callback_data="status")],
         [InlineKeyboardButton("🔄 Manuel Geçiş", callback_data="switch")],
-        [InlineKeyboardButton(auto, callback_data="toggle_auto")],
+        [InlineKeyboardButton(f"⚙️ Otomatik: {auto}", callback_data="toggle_auto")],
         [InlineKeyboardButton("📋 Node'lar", callback_data="nodes")],
     ])
 
@@ -264,15 +260,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ALLOWED_IDS:
         await update.message.reply_text("❌ Yetkiniz yok!")
         return
-    
     if not api.login():
-        await update.message.reply_text("❌ PasarGuard API bağlantısı başarısız!")
+        await update.message.reply_text("❌ API bağlantısı başarısız! Logları kontrol edin.")
         return
-    
     state = load_state()
     await update.message.reply_text(
         "🛡️ **PasarGuard Failover Bot**\n\n"
-        "Host'ta 2 IP, 3 node döngüsel.\n"
+        "3 node arasında otomatik geçiş.\n"
         "Trafik düşünce sıradaki node devreye girer.\n\n"
         "📌 Menüyü kullanın.",
         reply_markup=menu_kb(state),
@@ -282,11 +276,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    
     if q.from_user.id not in ALLOWED_IDS:
         await q.edit_message_text("❌ Yetkiniz yok!")
         return
-    
     state = load_state()
     action = q.data
     
@@ -294,25 +286,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ip1, ip2 = get_current_host_ips()
         bps = calc_bps(state)
         save_state(state)
-        
         current_idx = state.get("node_index", 0) % len(NODE_LIST)
         next_idx = (current_idx + 1) % len(NODE_LIST)
         standby_idx = (next_idx + 1) % len(NODE_LIST)
-        
-        text = "📊 **Durum**\n\n"
-        text += f"**Host IP'leri:**\n"
-        text += f"  - Host 1: `{ip1 or 'Bilinmiyor'}`\n"
-        text += f"  - Host 2: `{ip2 or 'Bilinmiyor'}`\n\n"
-        text += f"**Node Döngüsü:**\n"
-        text += f"  - ✅ {NODE_LIST[current_idx]['name']} (Aktif-1)\n"
-        text += f"  - ✅ {NODE_LIST[next_idx]['name']} (Aktif-2)\n"
-        text += f"  - ⏸️ {NODE_LIST[standby_idx]['name']} (Yedek)\n\n"
+        text = f"📊 **Durum**\n\n"
+        text += f"**Host IP'leri:**\n  - Host 1: `{ip1 or 'Bilinmiyor'}`\n  - Host 2: `{ip2 or 'Bilinmiyor'}`\n\n"
+        text += f"**Node Döngüsü:**\n  - ✅ {NODE_LIST[current_idx]['name']} (Aktif-1)\n  - ✅ {NODE_LIST[next_idx]['name']} (Aktif-2)\n  - ⏸️ {NODE_LIST[standby_idx]['name']} (Yedek)\n\n"
         text += f"**Trafik:** {bps if bps is not None else 'Ölçülemiyor'} B/s\n"
         text += f"**Eşik:** {MIN_TRAFFIC_BPS} B/s\n\n"
         text += f"**Otomatik:** {'AÇIK' if state.get('auto_enabled') else 'KAPALI'}\n"
-        text += f"**Geçiş sayısı:** {state.get('switch_count', 0)}\n"
-        text += f"**Hata sayısı:** {state.get('bad_count', 0)}/{FAIL_COUNT}"
-        
+        text += f"**Geçiş:** {state.get('switch_count', 0)} kez\n"
+        text += f"**Hata:** {state.get('bad_count', 0)}/{FAIL_COUNT}"
         await q.edit_message_text(text, reply_markup=menu_kb(state), parse_mode="Markdown")
     
     elif action == "switch":
@@ -325,22 +309,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "toggle_auto":
         state["auto_enabled"] = not state.get("auto_enabled", True)
         save_state(state)
-        await q.edit_message_text(
-            f"✅ Otomatik: {'AÇIK' if state['auto_enabled'] else 'KAPALI'}",
-            reply_markup=menu_kb(state)
-        )
+        await q.edit_message_text(f"✅ Otomatik: {'AÇIK' if state['auto_enabled'] else 'KAPALI'}", reply_markup=menu_kb(state))
     
     elif action == "nodes":
         nodes = api.get_nodes()
         text = "📋 **Node'lar**\n\n"
         for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            nid = node.get("id")
-            name = node.get("name", f"Node-{nid}")
-            ip = node.get("ip", "IP yok")
-            text += f"  - {name} (ID:{nid}): {ip}\n"
-        
+            if isinstance(node, dict):
+                nid = node.get("id")
+                name = node.get("name", f"Node-{nid}")
+                ip = node.get("ip", "IP yok")
+                text += f"  - {name} (ID:{nid}): {ip}\n"
         await q.edit_message_text(text, reply_markup=menu_kb(state))
 
 
@@ -349,50 +328,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 
 async def auto_failover_job(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue ile çalışan failover"""
     state = load_state()
-    
     if not state.get("auto_enabled", True):
         return
-    
     if not api.ensure_login():
         logging.error("API giriş başarısız!")
         return
-    
     bps = calc_bps(state)
     save_state(state)
-    
     if bps is None:
         return
-    
     if bps < MIN_TRAFFIC_BPS:
         state["bad_count"] = state.get("bad_count", 0) + 1
-        logging.info(f"⚠️ Düşük trafik: {bps} B/s ({state['bad_count']}/{FAIL_COUNT})")
-        
         if state["bad_count"] >= FAIL_COUNT:
             logging.info("🔄 Otomatik failover başlatılıyor...")
-            
             if switch_to_next_node(state):
                 save_state(state)
                 for uid in ALLOWED_IDS:
                     try:
-                        await context.bot.send_message(
-                            uid,
-                            f"🔄 **Otomatik Failover!**\n"
-                            f"Trafik: {bps} B/s\n"
-                            f"Geçiş: {state.get('switch_count', 0)}. kez"
-                        )
+                        await context.bot.send_message(uid, f"🔄 **Failover!**\nTrafik: {bps} B/s\nGeçiş: {state.get('switch_count', 0)}. kez")
                     except:
                         pass
             else:
-                logging.error("❌ Failover başarısız!")
                 state["bad_count"] = 0
                 save_state(state)
     else:
         if state["bad_count"] > 0:
             state["bad_count"] = 0
             save_state(state)
-            logging.info(f"✅ Trafik normale döndü: {bps} B/s")
 
 
 # ============================================
@@ -405,6 +368,7 @@ def main():
     print(f"📊 Node'lar: {len(NODE_LIST)} adet")
     print("=" * 40)
     
+    # Önce giriş testi yap
     if not api.login():
         print("❌ API bağlantısı başarısız! Çıkılıyor...")
         return
@@ -416,9 +380,8 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     
     # JobQueue'yi başlat
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(auto_failover_job, interval=CHECK_INTERVAL, first=5)
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_failover_job, interval=CHECK_INTERVAL, first=5)
         print(f"🔄 Otomatik failover başlatıldı! (Her {CHECK_INTERVAL}s)")
     else:
         print("❌ JobQueue başlatılamadı!")
