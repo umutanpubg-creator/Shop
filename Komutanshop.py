@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Pasarguard Bot - ÇALIŞAN VERSİYON
-API: Form-Data ile giriş yapıyor
+Pasarguard Bot - DÜZELTİLMİŞ
 """
 
 import telebot
@@ -26,14 +25,8 @@ ADMIN_USER = "komutan31"
 ADMIN_PASS = "KomutanPanel_13"
 ALLOWED_IDS = [8359722718, 7115611768]
 
-# Node'lar (paneldeki gerçek node ID'leri ile güncelle)
-NODES = [
-    {"id": 1, "name": "Node-1", "ip": "11.22.33.44"},
-    {"id": 2, "name": "Node-2", "ip": "55.66.77.88"},
-]
-
 # ============================================
-# API SINIFI - FORM-DATA İLE GİRİŞ
+# API SINIFI - DÜZELTİLMİŞ
 # ============================================
 
 class PasarGuardAPI:
@@ -42,11 +35,11 @@ class PasarGuardAPI:
         self.session = requests.Session()
         self.session.verify = False
         self.base_url = PANEL_URL
+        self.nodes_cache = []
+        self.last_nodes_update = 0
         
     def login(self):
-        """PasarGuard API'sine giriş yap - Form-Data formatında"""
         try:
-            # Form-data olarak gönder (ÇALIŞIYOR!)
             login_data = {
                 "username": ADMIN_USER,
                 "password": ADMIN_PASS
@@ -54,7 +47,7 @@ class PasarGuardAPI:
             
             response = self.session.post(
                 f"{self.base_url}/api/admin/token",
-                data=login_data,  # data= kullan, json= değil!
+                data=login_data,
                 timeout=10
             )
             
@@ -79,47 +72,76 @@ class PasarGuardAPI:
         return False
     
     def get_nodes(self):
-        """Node listesini getir"""
+        """Node listesini getir - Hata yönetimi eklendi"""
         try:
             response = self.session.get(
                 f"{self.base_url}/api/nodes",
                 timeout=10
             )
+            
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                
+                # Eğer data string ise parse et
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except:
+                        logging.error("Node verisi string ama JSON değil")
+                        return []
+                
+                # Eğer data dict ise ve içinde nodes varsa
+                if isinstance(data, dict):
+                    if 'nodes' in data:
+                        return data['nodes']
+                    elif 'data' in data:
+                        return data['data']
+                    # Belki doğrudan node listesi dict içinde
+                    return [data] if data else []
+                
+                # Eğer data list ise
+                if isinstance(data, list):
+                    return data
+                
+                logging.warning(f"Beklenmeyen node veri formatı: {type(data)}")
+                return []
+                
             return []
+            
         except Exception as e:
             logging.error(f"Node listesi alınamadı: {e}")
             return []
     
     def get_node_stats(self, node_id):
-        """Node istatistiklerini getir"""
         try:
             response = self.session.get(
                 f"{self.base_url}/api/nodes/{node_id}/stats",
                 timeout=10
             )
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                if isinstance(data, str):
+                    return json.loads(data)
+                return data
             return {}
         except Exception as e:
             logging.error(f"Node stats alınamadı: {e}")
             return {}
     
-    def get_hosts(self):
-        """Host bilgilerini getir"""
+    def get_active_node_ip(self):
+        """Aktif node'un IP'sini getir"""
         try:
-            # Önce node'ları al
             nodes = self.get_nodes()
             if nodes and len(nodes) > 0:
-                # İlk node'un IP'sini döndür
-                return {"ip": nodes[0].get("ip", "Bilinmiyor")}
-            return {"ip": "Bilinmiyor"}
+                # İlk node'un IP'sini al
+                first_node = nodes[0]
+                if isinstance(first_node, dict):
+                    return first_node.get("ip", "Bilinmiyor")
+            return "Bilinmiyor"
         except:
-            return {"ip": "Bilinmiyor"}
+            return "Bilinmiyor"
     
     def update_node_ip(self, node_id, ip):
-        """Node IP'sini güncelle"""
         try:
             response = self.session.put(
                 f"{self.base_url}/api/nodes/{node_id}",
@@ -132,24 +154,20 @@ class PasarGuardAPI:
             return False
     
     def switch_node(self, new_node_id):
-        """Aktif node'u değiştir"""
         try:
-            # Önce tüm node'ları al
             nodes = self.get_nodes()
             if not nodes:
                 return False
             
-            # Hedef node'u bul
             target_node = None
             for node in nodes:
-                if node.get("id") == new_node_id:
+                if isinstance(node, dict) and node.get("id") == new_node_id:
                     target_node = node
                     break
             
             if not target_node:
                 return False
             
-            # Node'u güncelle
             return self.update_node_ip(new_node_id, target_node.get("ip"))
             
         except Exception as e:
@@ -157,23 +175,51 @@ class PasarGuardAPI:
             return False
 
 # ============================================
-# BOT KODU
+# BOT KODU - DÜZELTİLMİŞ
 # ============================================
 
 api = PasarGuardAPI()
 bot = telebot.TeleBot(BOT_TOKEN)
 STATE_FILE = "state.json"
-logging.basicConfig(level=logging.INFO)
+
+# Varsayılan node'lar (panelden çekilecek)
+DEFAULT_NODES = [
+    {"id": 1, "name": "Node-1", "ip": "11.22.33.44"},
+    {"id": 2, "name": "Node-2", "ip": "55.66.77.88"},
+]
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"active": NODES[0]["id"], "auto": True, "bad": 0, "switches": 0}
-    with open(STATE_FILE, "r") as f:
-        return json.load(f)
+        return {"active": 1, "auto": True, "bad": 0, "switches": 0}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"active": 1, "auto": True, "bad": 0, "switches": 0}
 
 def save_state(s):
     with open(STATE_FILE, "w") as f:
         json.dump(s, f, indent=2)
+
+def get_nodes_from_api():
+    """API'den node'ları al, hata durumunda default kullan"""
+    try:
+        nodes = api.get_nodes()
+        if nodes and len(nodes) > 0:
+            # Node'ları düzgün formata çevir
+            formatted_nodes = []
+            for node in nodes:
+                if isinstance(node, dict):
+                    formatted_nodes.append({
+                        "id": node.get("id", 0),
+                        "name": node.get("name", f"Node-{node.get('id', 0)}"),
+                        "ip": node.get("ip", "0.0.0.0")
+                    })
+            return formatted_nodes
+    except Exception as e:
+        logging.error(f"Node çekme hatası: {e}")
+    
+    return DEFAULT_NODES
 
 def menu():
     kb = InlineKeyboardMarkup()
@@ -190,8 +236,7 @@ def start(msg):
         return
     
     state = load_state()
-    hosts = api.get_hosts()
-    ip = hosts.get("ip", "Bilinmiyor")
+    ip = api.get_active_node_ip()
     
     bot.send_message(msg.chat.id,
         f"🛡️ **Pasarguard Bot**\n\n"
@@ -210,10 +255,10 @@ def callback(call):
     
     state = load_state()
     data = call.data
+    nodes = get_nodes_from_api()
     
     if data == "status":
-        hosts = api.get_hosts()
-        ip = hosts.get("ip", "Bilinmiyor")
+        ip = api.get_active_node_ip()
         bot.edit_message_text(
             f"📊 **Durum**\n\n📍 IP: `{ip}`\n🔄 Otomatik: {'AÇIK' if state['auto'] else 'KAPALI'}\n⚠️ Hata: {state['bad']}/3\n🔄 Geçiş: {state['switches']}",
             call.message.chat.id,
@@ -223,12 +268,20 @@ def callback(call):
         )
     
     elif data == "switch":
-        # Sıradaki node'a geç
+        if not nodes:
+            bot.answer_callback_query(call.id, "❌ Node listesi boş!")
+            return
+            
         active = state["active"]
-        for i, n in enumerate(NODES):
+        # Mevcut node'u bul
+        current_index = 0
+        for i, n in enumerate(nodes):
             if n["id"] == active:
-                next_node = NODES[(i+1) % len(NODES)]
+                current_index = i
                 break
+        
+        # Sıradaki node
+        next_node = nodes[(current_index + 1) % len(nodes)]
         
         if api.switch_node(next_node["id"]):
             state["active"] = next_node["id"]
@@ -239,8 +292,7 @@ def callback(call):
         else:
             bot.answer_callback_query(call.id, "❌ Geçiş başarısız!")
         
-        hosts = api.get_hosts()
-        ip = hosts.get("ip", "Bilinmiyor")
+        ip = api.get_active_node_ip()
         bot.edit_message_text(
             f"🛡️ **Pasarguard Bot**\n\n📍 IP: `{ip}`\n🔄 Otomatik: {'AÇIK' if state['auto'] else 'KAPALI'}\n⚠️ Hata: {state['bad']}/3",
             call.message.chat.id,
@@ -251,11 +303,14 @@ def callback(call):
     
     elif data == "nodes":
         text = "📋 **Node'lar**\n\n"
-        for n in NODES:
-            active = "▶️ " if n["id"] == state["active"] else "   "
-            stats = api.get_node_stats(n["id"])
-            bps = stats.get("current_bps", 0)
-            text += f"{active}{n['name']}: {n['ip']} ({bps} B/s)\n"
+        if not nodes:
+            text = "❌ Node listesi alınamadı!"
+        else:
+            for n in nodes:
+                active = "▶️ " if n["id"] == state["active"] else "   "
+                stats = api.get_node_stats(n["id"])
+                bps = stats.get("current_bps", 0)
+                text += f"{active}{n['name']}: {n['ip']} ({bps} B/s)\n"
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=menu())
     
     elif data == "auto":
@@ -270,7 +325,6 @@ def callback(call):
         )
 
 def auto_failover():
-    """Otomatik failover kontrolü"""
     while True:
         try:
             state = load_state()
@@ -279,45 +333,35 @@ def auto_failover():
                 stats = api.get_node_stats(active)
                 bps = stats.get("current_bps", 0)
                 
-                # Eğer trafik 1000 bytes/s altındaysa hata sayısını artır
                 if bps < 1000:
                     state["bad"] = state.get("bad", 0) + 1
-                    logging.info(f"⚠️ Düşük trafik: {bps} B/s, Hata: {state['bad']}/3")
-                    
                     if state["bad"] >= 3:
-                        # Geçiş yap
-                        for i, n in enumerate(NODES):
-                            if n["id"] == active:
-                                next_node = NODES[(i+1) % len(NODES)]
-                                break
-                        
-                        logging.info(f"🔄 Failover başlatılıyor: {next_node['name']}")
-                        
-                        if api.switch_node(next_node["id"]):
-                            state["active"] = next_node["id"]
-                            state["bad"] = 0
-                            state["switches"] = state.get("switches", 0) + 1
-                            save_state(state)
+                        nodes = get_nodes_from_api()
+                        if nodes:
+                            for i, n in enumerate(nodes):
+                                if n["id"] == active:
+                                    next_node = nodes[(i+1) % len(nodes)]
+                                    break
                             
-                            # Admin'lere bildir
-                            for uid in ALLOWED_IDS:
-                                try:
-                                    bot.send_message(uid, 
-                                        f"🔄 **Otomatik Failover!**\n"
-                                        f"✅ {next_node['name']} ({next_node['ip']}) geçildi!"
-                                    )
-                                except:
-                                    pass
+                            if api.switch_node(next_node["id"]):
+                                state["active"] = next_node["id"]
+                                state["bad"] = 0
+                                state["switches"] = state.get("switches", 0) + 1
+                                save_state(state)
+                                
+                                for uid in ALLOWED_IDS:
+                                    try:
+                                        bot.send_message(uid, 
+                                            f"🔄 **Otomatik Failover!**\n"
+                                            f"✅ {next_node['name']} ({next_node['ip']}) geçildi!"
+                                        )
+                                    except:
+                                        pass
                 else:
-                    # Trafik normal, hatayı sıfırla
-                    if state["bad"] > 0:
-                        state["bad"] = 0
-                        save_state(state)
-                        logging.info(f"✅ Trafik normale döndü: {bps} B/s")
-                        
+                    state["bad"] = 0
+                save_state(state)
         except Exception as e:
             logging.error(f"Auto-failover hatası: {e}")
-        
         time.sleep(30)
 
 # ============================================
@@ -328,37 +372,24 @@ print("🚀 Pasarguard Bot başlatılıyor...")
 print(f"📡 Panel URL: {PANEL_URL}")
 print(f"👤 Kullanıcı: {ADMIN_USER}")
 
-# API'ye giriş yap
 if api.login():
     print("✅ Panel API bağlantısı başarılı!")
     
-    # Node'ları kontrol et
-    nodes = api.get_nodes()
-    if nodes:
-        print(f"📋 Paneldeki node'lar: {len(nodes)} adet")
-        for node in nodes:
-            print(f"   - Node {node.get('id')}: {node.get('name', 'Isimsiz')} ({node.get('ip', 'IP yok')})")
-    else:
-        print("⚠️ Node listesi alınamadı veya boş!")
+    # Node'ları al
+    nodes = get_nodes_from_api()
+    print(f"📋 Paneldeki node'lar: {len(nodes)} adet")
+    for node in nodes:
+        print(f"   - Node {node['id']}: {node['name']} ({node['ip']})")
 else:
     print("❌ Panel API bağlantısı başarısız!")
-    print("   Lütfen şunları kontrol edin:")
-    print(f"   - Panel URL: {PANEL_URL}")
-    print(f"   - Kullanıcı adı: {ADMIN_USER}")
-    print("   - Şifre doğru mu?")
 
-# Auto failover'ı başlat
 threading.Thread(target=auto_failover, daemon=True).start()
 print("🔄 Otomatik failover başlatıldı!")
 
 print("✅ Bot çalışıyor! Telegram'da /start yazın.")
-print("📊 Loglar aşağıda görünecek...")
 print("=" * 50)
 
-# Bot'u başlat
 try:
     bot.infinity_polling()
 except KeyboardInterrupt:
     print("\n🛑 Bot durduruldu.")
-except Exception as e:
-    print(f"❌ Bot hatası: {e}")
