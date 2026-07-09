@@ -13,30 +13,121 @@ PASARGUARD FULL FAILOVER BOT
 ✅ Geçiş sayacı
 """
 
-import os,json,time,logging,threading
-import requests
+import os, json, time, logging, threading, asyncio
+from contextlib import asynccontextmanager
+from typing import Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import urllib3
 urllib3.disable_warnings()
 
 # ============================================
-# KONFIGÜRASYON
+# PASARGUARD API SINIFI (SENİN KODUNDAN)
+# ============================================
+
+class PasarguardAPI:
+    """Pasarguard paneli için API istemcisi"""
+    
+    def __init__(self, base_url: str, verify: bool = False, timeout: float = 30.0):
+        self.base_url = base_url.rstrip('/')
+        self.verify = verify
+        self.timeout = timeout
+        self.session = None
+    
+    async def __aenter__(self):
+        import aiohttp
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            connector=aiohttp.TCPConnector(ssl=self.verify)
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def get_token(self, username: str, password: str) -> dict:
+        """Kullanıcı giriş yapıp token alır"""
+        async with self.session.post(
+            f"{self.base_url}/api/admin/token",
+            data={"username": username, "password": password}
+        ) as response:
+            response.raise_for_status()
+            data = await response.json()
+            return data
+    
+    async def get_users(self, token: str, offset: int = 0, limit: int = 50):
+        """Kullanıcı listesini getir"""
+        headers = {"Authorization": f"Bearer {token}"}
+        async with self.session.get(
+            f"{self.base_url}/api/users?offset={offset}&limit={limit}",
+            headers=headers
+        ) as response:
+            if response.status == 200:
+                return await response.json()
+            return None
+    
+    async def get_user(self, username: str, token: str):
+        """Belirli bir kullanıcıyı getir"""
+        headers = {"Authorization": f"Bearer {token}"}
+        async with self.session.get(
+            f"{self.base_url}/api/users/{username}",
+            headers=headers
+        ) as response:
+            if response.status == 200:
+                return await response.json()
+            return None
+    
+    async def create_user(self, username: str, token: str, data: dict):
+        """Yeni kullanıcı oluştur"""
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with self.session.post(
+            f"{self.base_url}/api/users",
+            json=data,
+            headers=headers
+        ) as response:
+            if response.status == 200 or response.status == 201:
+                return await response.json()
+            return None
+    
+    async def remove_user(self, username: str, token: str):
+        """Kullanıcıyı sil"""
+        headers = {"Authorization": f"Bearer {token}"}
+        async with self.session.delete(
+            f"{self.base_url}/api/users/{username}",
+            headers=headers
+        ) as response:
+            return response.status == 200
+    
+    async def get_system_stats(self, token: str):
+        """Sistem istatistiklerini getir"""
+        headers = {"Authorization": f"Bearer {token}"}
+        async with self.session.get(
+            f"{self.base_url}/api/stats",
+            headers=headers
+        ) as response:
+            if response.status == 200:
+                return await response.json()
+            return None
+
+# ============================================
+# KONFIGÜRASYON (SENİN VERDİKLERİN)
 # ============================================
 
 BOT_TOKEN = "8850038202:AAGkr_QlbJJxSAvHR20-zLpWFYUSrYcwa0U"
-PANEL_URL = "https://crc.fastline-tm-belet-film.ru:8000"
-ADMIN_USER = "komutan31"
-ADMIN_PASS = "KomutanPanel_13"
-SS_TAG = "Shadowsocks TCP"
-ALLOWED_IDS = [8359722718, 7115611768]
+PASARGUARD_BASE_URL = "https://www.fastline-tm-belet-film.ru:8000"
+ADMIN_USERNAME = "Komutan"
+ADMIN_PASSWORD = "KomutanPanel_13"
+
+# SADECE BU ID'LER KULLANABİLİR
+ALLOWED_IDS = [8359722718, 7115611768]  # Sadece senin belirlediğin adminler
 
 CHECK_INTERVAL = 30          # Kontrol aralığı (saniye)
 MIN_TRAFFIC_BPS = 500        # Minimum trafik eşiği
 FAIL_COUNT = 3               # Kaç hata sonrası geçiş
 NET_IFACE = "eth0"           # Ağ arayüzü
 
-# 3 NODE (SIRALI DÖNGÜ)
+# 3 NODE (SIRALI DÖNGÜ) - Burayı kendi node'larına göre düzenle
 NODE_LIST = [
     {"id": 1, "name": "Node-1", "ip": "11.22.33.44"},
     {"id": 2, "name": "Node-2", "ip": "55.66.77.88"},
@@ -44,54 +135,99 @@ NODE_LIST = [
 ]
 
 STATE_FILE = "full_state.json"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+ACCESS_TOKEN = None
+API_INSTANCE = None
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
 # ============================================
-# API SINIFI
+# API YÖNETİMİ (SENİN KODUNDAN UYARLANDI)
 # ============================================
 
-class PasarAPI:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.verify = False
-        self.token = None
+async def get_token():
+    """Token alır ve global değişkene kaydeder"""
+    global ACCESS_TOKEN
+    async with PasarguardAPI(
+        base_url=PASARGUARD_BASE_URL,
+        verify=False,
+        timeout=30.0
+    ) as api:
+        token_data = await api.get_token(
+            username=ADMIN_USERNAME,
+            password=ADMIN_PASSWORD
+        )
+        ACCESS_TOKEN = token_data.get("access_token")
+        logging.info("✅ Token alındı")
+        return ACCESS_TOKEN
 
-    def login(self):
-        try:
-            r = self.session.post(
-                f"{PANEL_URL}/api/admin/token",
-                data={"username": ADMIN_USER, "password": ADMIN_PASS},
-                timeout=10
-            )
-            if r.status_code == 200:
-                self.token = r.json().get("access_token")
-                self.session.headers.update({
-                    "Authorization": f"Bearer {self.token}",
-                    "Content-Type": "application/json"
-                })
-                logging.info("✅ API giriş başarılı")
-                return True
-            logging.error(f"❌ Giriş başarısız: {r.status_code}")
-            return False
-        except Exception as e:
-            logging.error(f"❌ Hata: {e}")
-            return False
+@asynccontextmanager
+async def get_api():
+    """API bağlantısı için context manager"""
+    async with PasarguardAPI(
+        base_url=PASARGUARD_BASE_URL,
+        verify=False,
+        timeout=30.0
+    ) as api:
+        yield api
 
-    def get(self, endpoint):
+async def ensure_token():
+    """Token varsa döndür, yoksa al"""
+    global ACCESS_TOKEN
+    if ACCESS_TOKEN is None:
+        await get_token()
+    return ACCESS_TOKEN
+
+async def get_hosts():
+    """Host konfigürasyonunu getir"""
+    token = await ensure_token()
+    async with get_api() as api:
+        # Pasarguard API'sinde host'ları almak için endpoint
+        # NOT: Bu endpoint senin panel versiyonuna göre değişebilir
         try:
-            r = self.session.get(f"{PANEL_URL}{endpoint}", timeout=10)
-            return r.json() if r.status_code == 200 else None
+            async with api.session.get(
+                f"{PASARGUARD_BASE_URL}/api/hosts",
+                headers={"Authorization": f"Bearer {token}"}
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                return None
         except:
             return None
 
-    def put(self, endpoint, data):
+async def get_nodes():
+    """Node listesini getir"""
+    token = await ensure_token()
+    async with get_api() as api:
         try:
-            r = self.session.put(f"{PANEL_URL}{endpoint}", json=data, timeout=10)
-            return r.status_code == 200
+            async with api.session.get(
+                f"{PASARGUARD_BASE_URL}/api/nodes",
+                headers={"Authorization": f"Bearer {token}"}
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                return None
+        except:
+            return None
+
+async def update_hosts(hosts_data):
+    """Host konfigürasyonunu güncelle"""
+    token = await ensure_token()
+    async with get_api() as api:
+        try:
+            async with api.session.put(
+                f"{PASARGUARD_BASE_URL}/api/hosts",
+                json=hosts_data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                }
+            ) as response:
+                return response.status == 200
         except:
             return False
-
-api = PasarAPI()
 
 # ============================================
 # STATE YÖNETİMİ
@@ -100,19 +236,18 @@ api = PasarAPI()
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {
-            "node_index": 0,           # Sıradaki node
-            "auto_enabled": True,      # Otomatik açık/kapalı
-            "bad_count": 0,            # Hata sayacı
-            "switch_count": 0,         # Toplam geçiş
+            "node_index": 0,
+            "auto_enabled": True,
+            "bad_count": 0,
+            "switch_count": 0,
             "last_rx": None,
             "last_tx": None,
             "last_ts": None,
-            "last_switch_time": None,  # Son geçiş zamanı
-            "traffic_history": [],     # Trafik geçmişi
+            "last_switch_time": None,
+            "traffic_history": [],
         }
     with open(STATE_FILE, "r") as f:
         data = json.load(f)
-    # Eksik alanları doldur
     data.setdefault("node_index", 0)
     data.setdefault("auto_enabled", True)
     data.setdefault("bad_count", 0)
@@ -124,15 +259,16 @@ def load_state():
     data.setdefault("traffic_history", [])
     return data
 
-def save_state(s):
+def save_state(state):
     with open(STATE_FILE, "w") as f:
-        json.dump(s, f, indent=2)
+        json.dump(state, f, indent=2)
 
 # ============================================
 # TRAFİK ÖLÇÜM
 # ============================================
 
 def calc_bps(state):
+    """/proc/net/dev'den trafik ölçer"""
     now = time.time()
     try:
         with open("/proc/net/dev", "r") as f:
@@ -162,7 +298,6 @@ def calc_bps(state):
     delta = (rx - int(last_rx)) + (tx - int(last_tx))
     bps = int(delta / dt)
 
-    # Trafik geçmişini kaydet (son 20 kayıt)
     history = state.get("traffic_history", [])
     history.append({"time": now, "bps": bps})
     if len(history) > 20:
@@ -175,37 +310,39 @@ def calc_bps(state):
 # CORE MANTIK
 # ============================================
 
-def get_host_ips():
-    h = api.get("/api/hosts")
-    if not h:
+async def get_host_ips():
+    """Host IP'lerini getir"""
+    hosts = await get_hosts()
+    if not hosts:
         return None, None
-    ss = h.get(SS_TAG, [])
-    if isinstance(ss, list) and len(ss) >= 2:
-        return ss[0].get("address"), ss[1].get("address")
+    # Shadowsocks TCP host'larını bul
+    ss_hosts = hosts.get("Shadowsocks TCP", [])
+    if isinstance(ss_hosts, list) and len(ss_hosts) >= 2:
+        return ss_hosts[0].get("address"), ss_hosts[1].get("address")
     return None, None
 
-def set_host_ips(ip1, ip2):
-    h = api.get("/api/hosts")
-    if not h or SS_TAG not in h:
+async def set_host_ips(ip1, ip2):
+    """Host IP'lerini güncelle"""
+    hosts = await get_hosts()
+    if not hosts:
         return False
-    ss = h[SS_TAG]
-    if not isinstance(ss, list) or len(ss) < 2:
+    ss_hosts = hosts.get("Shadowsocks TCP", [])
+    if not isinstance(ss_hosts, list) or len(ss_hosts) < 2:
         return False
-    ss[0]["address"] = ip1
-    ss[1]["address"] = ip2
-    ss[0]["is_disabled"] = False
-    ss[1]["is_disabled"] = False
-    h[SS_TAG] = ss
-    return api.put("/api/hosts", h)
+    ss_hosts[0]["address"] = ip1
+    ss_hosts[1]["address"] = ip2
+    ss_hosts[0]["is_disabled"] = False
+    ss_hosts[1]["is_disabled"] = False
+    hosts["Shadowsocks TCP"] = ss_hosts
+    return await update_hosts(hosts)
 
-def switch_to_next_node(state, notify=True):
+async def switch_to_next_node(state, notify=True):
     """Sıradaki node'a geç"""
-    nodes = api.get("/api/nodes")
+    nodes = await get_nodes()
     if not nodes:
         logging.error("❌ Node listesi alınamadı!")
         return False, None
 
-    # Node IP'lerini al
     node_ips = {}
     for n in nodes:
         if isinstance(n, dict):
@@ -222,7 +359,7 @@ def switch_to_next_node(state, notify=True):
 
     logging.info(f"🔄 Geçiş: {node1['name']} ({ip1}) / {node2['name']} ({ip2})")
 
-    if set_host_ips(ip1, ip2):
+    if await set_host_ips(ip1, ip2):
         state["node_index"] = (nxt + 1) % len(NODE_LIST)
         state["bad_count"] = 0
         state["switch_count"] = state.get("switch_count", 0) + 1
@@ -233,25 +370,13 @@ def switch_to_next_node(state, notify=True):
         logging.error("❌ Geçiş başarısız!")
         return False, None
 
-def get_node_stats():
-    """Node istatistiklerini al"""
-    nodes = api.get("/api/nodes")
-    if not nodes:
-        return []
-    stats = []
-    for n in nodes:
-        if isinstance(n, dict):
-            stats.append({
-                "id": n.get("id"),
-                "name": n.get("name", f"Node-{n.get('id')}"),
-                "ip": n.get("ip", "IP yok"),
-                "status": n.get("status", "unknown"),
-            })
-    return stats
+# ============================================
+# TELEGRAM BOT (SADECE ADMINLER)
+# ============================================
 
-# ============================================
-# TELEGRAM BOT
-# ============================================
+def is_admin(user_id):
+    """Kullanıcının admin olup olmadığını kontrol et"""
+    return user_id in ALLOWED_IDS
 
 def main_menu(state):
     auto = "🟢 AÇIK" if state.get("auto_enabled", True) else "🔴 KAPALI"
@@ -265,12 +390,14 @@ def main_menu(state):
     ])
 
 async def start(update, context):
-    if update.effective_user.id not in ALLOWED_IDS:
-        await update.message.reply_text("❌ Yetkiniz yok!")
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ **YETKİNİZ YOK!**\nBu bot sadece adminler tarafından kullanılabilir.", parse_mode="Markdown")
         return
-    if not api.login():
-        await update.message.reply_text("❌ API bağlantısı başarısız!")
-        return
+    
+    # Token'ı kontrol et
+    await ensure_token()
+    
     state = load_state()
     await update.message.reply_text(
         "🛡️ **PasarGuard Failover Bot**\n\n"
@@ -286,8 +413,10 @@ async def start(update, context):
 async def callback_handler(update, context):
     q = update.callback_query
     await q.answer()
-    if q.from_user.id not in ALLOWED_IDS:
-        await q.edit_message_text("❌ Yetkiniz yok!")
+    
+    user_id = q.from_user.id
+    if not is_admin(user_id):
+        await q.edit_message_text("❌ **YETKİNİZ YOK!**", parse_mode="Markdown")
         return
 
     state = load_state()
@@ -295,7 +424,7 @@ async def callback_handler(update, context):
 
     # ===== DURUM =====
     if action == "status":
-        ip1, ip2 = get_host_ips()
+        ip1, ip2 = await get_host_ips()
         bps = calc_bps(state)
         save_state(state)
 
@@ -336,7 +465,7 @@ async def callback_handler(update, context):
 
     # ===== MANUEL GEÇİŞ =====
     elif action == "switch":
-        success, msg = switch_to_next_node(state)
+        success, msg = await switch_to_next_node(state)
         if success:
             save_state(state)
             await q.edit_message_text(f"✅ **Manuel geçiş başarılı!**\n{msg}", reply_markup=main_menu(state))
@@ -360,13 +489,14 @@ async def callback_handler(update, context):
 
     # ===== NODE LİSTESİ =====
     elif action == "nodes":
-        nodes = get_node_stats()
+        nodes = await get_nodes()
         text = "📋 **NODE LİSTESİ**\n\n"
         if nodes:
             for n in nodes:
-                text += f"  ├ {n['name']} (ID:{n['id']})\n"
-                text += f"  │  ├ IP: {n['ip']}\n"
-                text += f"  │  └ Durum: {n['status']}\n\n"
+                if isinstance(n, dict):
+                    text += f"  ├ {n.get('name', 'Bilinmiyor')} (ID:{n.get('id')})\n"
+                    text += f"  │  ├ IP: {n.get('ip', 'Bilinmiyor')}\n"
+                    text += f"  │  └ Durum: {n.get('status', 'Bilinmiyor')}\n\n"
         else:
             text = "❌ Node listesi alınamadı!"
         await q.edit_message_text(text, reply_markup=main_menu(state))
@@ -392,10 +522,8 @@ async def auto_failover(context):
     if not state.get("auto_enabled", True):
         return
 
-    # API kontrol
-    if not api.login():
-        logging.error("API giriş başarısız!")
-        return
+    # Token'ı kontrol et
+    await ensure_token()
 
     # Trafik ölç
     bps = calc_bps(state)
@@ -411,7 +539,7 @@ async def auto_failover(context):
 
         if state["bad_count"] >= FAIL_COUNT:
             logging.info("🔄 Otomatik failover başlatılıyor...")
-            success, msg = switch_to_next_node(state)
+            success, msg = await switch_to_next_node(state)
 
             if success:
                 save_state(state)
@@ -443,20 +571,19 @@ async def auto_failover(context):
 # MAIN
 # ============================================
 
-def main():
+async def main():
     print("🚀 PasarGuard FULL Failover Bot")
     print("=" * 40)
-    print(f"📡 Panel: {PANEL_URL}")
+    print(f"📡 Panel: {PASARGUARD_BASE_URL}")
     print(f"📊 Node: {len(NODE_LIST)} adet (3 node döngüsel)")
     print(f"⚙️  Kontrol: {CHECK_INTERVAL}s")
     print(f"📉 Eşik: {MIN_TRAFFIC_BPS} B/s")
     print(f"🔄 Geçiş: {FAIL_COUNT} hata sonrası")
+    print(f"👥 Adminler: {ALLOWED_IDS}")
     print("=" * 40)
 
-    if not api.login():
-        print("❌ API bağlantısı başarısız!")
-        return
-
+    # Token al
+    await ensure_token()
     print("✅ API bağlantısı başarılı!")
 
     # Bot'u başlat
@@ -466,13 +593,14 @@ def main():
 
     if app.job_queue:
         app.job_queue.run_repeating(auto_failover, interval=CHECK_INTERVAL, first=5)
-        print(f"🔄 Otomatik failover başlatıldı!")
+        print("🔄 Otomatik failover başlatıldı!")
     else:
         print("❌ JobQueue başlatılamadı!")
         return
 
     print("✅ Bot çalışıyor! Telegram'da /start yazın.")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
